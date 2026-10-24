@@ -1449,6 +1449,56 @@ def _awk_inline_program_span(items: list[_ShellWord], index: int) -> tuple[tuple
     return None, index + 1
 
 
+def _closes_command_substitution(command: str, close_index: int) -> bool:
+    """True when the ``)`` at ``close_index`` closes a ``$(...)`` substitution."""
+    depth = 0
+    for i in range(close_index, -1, -1):
+        char = command[i]
+        if char == ")":
+            depth += 1
+        elif char == "(":
+            depth -= 1
+            if depth == 0:
+                return i > 0 and command[i - 1] == "$"
+    return False
+
+
+_DIVISION_AFTER_CLOSER_BRACKET_SEGMENT = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?|[A-Za-z_][A-Za-z0-9_]*|\d+")
+
+
+def _is_division_after_closing_bracket(command: str, match: re.Match[str]) -> bool:
+    """A single ``/segment`` match right after ``)``/``]``/``}`` is division, not a path (#7444).
+
+    ``_ABSOLUTE_PATH_PATTERN`` only exempts a ``/`` preceded by a word character
+    or ``:``, so arithmetic written directly after a closing bracket was read as
+    an absolute path and rejected — #7023's exemption deliberately covered only
+    single-quoted awk programs. All-digit segments are exempt after any closer:
+    top-level host directories never start with a digit (the same rationale as
+    the ``$1/1024`` awk exemption). Identifier-like segments (including awk/perl
+    field references such as ``$F[2]``) are exempt after ``]``, which has no bash
+    path-building reading — glob-style relative paths like ``foo[1]/bar`` ride
+    the same exemption — and after ``)`` unless that paren closes a ``$(...)``
+    substitution, because ``$(dirname f)/x`` is real path building. After ``}``
+    an identifier stays a path: ``${HOME}/etc`` is brace expansion. Only single
+    segments are exempt, so ``/a/b`` shapes stay rejected.
+    """
+    segment = match.group()[1:]
+    if not segment or "/" in segment:
+        return False
+    closer = command[match.start() - 1] if match.start() else ""
+    if closer not in ")]}":
+        return False
+    if segment.isdigit():
+        return True
+    if _DIVISION_AFTER_CLOSER_BRACKET_SEGMENT.fullmatch(segment) is None:
+        return False
+    if closer == "]":
+        return True
+    if closer == ")":
+        return not _closes_command_substitution(command, match.start() - 1)
+    return False
+
+
 def _awk_program_field_spans(command: str) -> list[tuple[int, int]]:
     """Spans where ``$NAME/`` is an awk field reference rather than a path.
 
@@ -1844,6 +1894,8 @@ def validate_local_bash_command_paths(command: str, thread_data: ThreadDataState
                 awk_field_spans = _awk_program_field_spans(command)
             if _is_in_spans(match.start(), awk_field_spans):
                 continue
+        if _is_division_after_closing_bracket(command, match):
+            continue
         absolute_path = match.group()
         if _is_non_path_literal_fragment(absolute_path):
             continue

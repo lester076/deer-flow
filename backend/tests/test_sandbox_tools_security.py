@@ -2246,3 +2246,46 @@ def test_file_operation_lock_memory_cleanup() -> None:
 
     # 检查特定 key 是否被清理（而不是检查总长度）
     assert lock_key not in _FILE_OPERATION_LOCKS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Division written directly after a closing ``)``/``]``/``}`` outside awk
+        # programs is arithmetic, not an absolute host path (#7444). The awk
+        # exemption (#7023) deliberately covered only single-quoted awk
+        # programs, so these one-liner shapes were all rejected.
+        "python3 -c 'xs=[1,2,3]; print(sum(xs)/len(xs))'",
+        "python3 -c 'print((3+4)/2)'",
+        "perl -lane 'print $F[1]/2' /mnt/user-data/workspace/a.txt",
+        "perl -lane 'print $F[1]/$F[2]' /mnt/user-data/workspace/a.txt",
+        "echo $(( ${SIZE}/2 ))",
+        # A ``]`` closer has no bash path-building reading, so identifier-like
+        # segments after it are field arithmetic, and glob-style relative paths
+        # (``foo[1]/bar``) stay usable.
+        "cat foo[1]/bar",
+    ],
+)
+def test_validate_local_bash_command_paths_allows_division_after_closing_bracket(command: str) -> None:
+    validate_local_bash_command_paths(command, _THREAD_DATA)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # ``$(dirname f)/x`` is real path building through command substitution:
+        # the identifier segment after ``)`` stays rejected when the paren
+        # closes a ``$(...)`` (#7444).
+        "cat $(dirname main.py)/x",
+        # ``${HOME}/etc`` is a runtime host path: an identifier after ``}`` is
+        # brace expansion, never division.
+        "echo ${HOME}/etc",
+        # Without a closer in front, a digit segment is still an absolute path.
+        "ls /2",
+        # Multi-segment matches after a closer stay path-shaped and rejected.
+        "python3 -c 'open(\"/a/b\")'",
+    ],
+)
+def test_validate_local_bash_command_paths_rejects_path_building_after_closing_bracket(command: str) -> None:
+    with pytest.raises(PermissionError, match="Unsafe absolute paths in command"):
+        validate_local_bash_command_paths(command, _THREAD_DATA)
