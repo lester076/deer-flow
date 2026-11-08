@@ -7,8 +7,10 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.messages import HumanMessage
 
 from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
+from deerflow.agents.memory.backends.deermem.deermem.core.message_processing import filter_messages_for_memory
 from deerflow.agents.memory.backends.deermem.deermem.core.prompt import format_conversation_for_update
 from deerflow.agents.memory.backends.deermem.deermem.core.storage import (
     MemoryManifestRevisionConflict,
@@ -1029,6 +1031,14 @@ class TestExtractText:
 
 
 class TestFormatConversationForUpdate:
+    def test_format_kept_turn_with_deep_message_metadata(self):
+        metadata: dict[str, object] = {}
+        for _ in range(6000):
+            metadata = {"nested": metadata}
+        message = HumanMessage(content="Remember the release date.", additional_kwargs=metadata)
+
+        assert format_conversation_for_update(filter_messages_for_memory([message])) == "User: Remember the release date."
+
     def test_plain_string_messages(self):
         human_msg = MagicMock()
         human_msg.type = "human"

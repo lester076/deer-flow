@@ -796,9 +796,11 @@ def format_conversation_for_update(messages: list[Any]) -> str:
         Formatted conversation string.
     """
     lines = []
+    missing_content = object()
     for msg in messages:
         role = getattr(msg, "type", "unknown")
-        content = _content_to_text(getattr(msg, "content", str(msg)))
+        raw_content = getattr(msg, "content", missing_content)
+        content = _content_to_text(str(msg) if raw_content is missing_content else raw_content)
 
         # Strip the upload-context tag from human messages to avoid persisting
         # ephemeral file path info into long-term memory.  Skip the turn entirely
