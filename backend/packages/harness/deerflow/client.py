@@ -325,6 +325,12 @@ class DeerFlowClient:
             "is_plan_mode": overrides.get("plan_mode", self._plan_mode),
             "subagent_enabled": overrides.get("subagent_enabled", self._subagent_enabled),
         }
+        # Presence, not truthiness: an explicit `reasoning_effort=None` request
+        # must select the model profile default instead of the saved named-agent
+        # value, while an omitted override falls through to the saved value
+        # (#8596).
+        if "reasoning_effort" in overrides:
+            configurable["reasoning_effort"] = overrides["reasoning_effort"]
         return RunnableConfig(
             configurable=configurable,
             recursion_limit=overrides.get("recursion_limit", 100),
@@ -383,6 +389,9 @@ class DeerFlowClient:
         key = (
             cfg.get("model_name"),
             cfg.get("thinking_enabled"),
+            # Presence matters for the cache too: an explicit request None and
+            # an omitted override resolve to different effort values (#8596).
+            ("reasoning_effort" in cfg, cfg.get("reasoning_effort")),
             cfg.get("is_plan_mode"),
             cfg.get("subagent_enabled"),
             cfg.get("max_concurrent_subagents"),
@@ -402,6 +411,15 @@ class DeerFlowClient:
             return
 
         thinking_enabled = cfg.get("thinking_enabled", True)
+        # reasoning-effort precedence mirrors the Gateway runtime: request >
+        # saved named-agent default > model profile default (None). Presence in
+        # cfg (not truthiness) keeps an explicit request None on the profile
+        # default while an omitted override falls through to the saved agent
+        # value (#8596).
+        if "reasoning_effort" in cfg:
+            reasoning_effort = cfg["reasoning_effort"]
+        else:
+            reasoning_effort = getattr(agent_config, "reasoning_effort", None) if agent_config is not None else None
         model_name = cfg.get("model_name")
         if model_name is None:
             model_name = getattr(agent_config, "model", None)
@@ -481,7 +499,7 @@ class DeerFlowClient:
         # callbacks at the graph invocation root so a single embedded run
         # produces one trace with correct session_id / user_id propagation.
         # Attaching them again on the model would emit duplicate spans.
-        chat_model = create_chat_model(name=model_name, thinking_enabled=thinking_enabled, attach_tracing=False, model_overrides=agent_model_overrides)
+        chat_model = create_chat_model(name=model_name, thinking_enabled=thinking_enabled, attach_tracing=False, model_overrides=agent_model_overrides, reasoning_effort=reasoning_effort)
         tools = self._get_tools(model_name=model_name, subagent_enabled=subagent_enabled, mcp_plugins=mcp_plugins, groups=tool_groups, chat_model=chat_model)
 
         # Add framework-provided tools before authorization so Layer 1 sees

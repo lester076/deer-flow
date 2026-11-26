@@ -2172,6 +2172,7 @@ class TestEnsureAgent:
         client._agent_config_key = (
             None,
             True,
+            (False, None),
             False,
             False,
             None,
