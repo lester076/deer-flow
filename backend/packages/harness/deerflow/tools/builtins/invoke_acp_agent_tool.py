@@ -200,6 +200,31 @@ async def _await_while_agent_runs(awaitable: Any, proc: asyncio.subprocess.Proce
         await asyncio.gather(exchange, exited, return_exceptions=True)
 
 
+async def _select_acp_agent_model(conn: Any, session: Any, agent: str, model: str) -> None:
+    """Apply the configured model through the session's advertised selector.
+
+    The pinned ACP SDK routes unknown ``new_session`` kwargs into ``_meta``,
+    so passing ``model`` there never changes the session configuration
+    (#8599). Modern agents advertise a ``category: model`` select option
+    (set via ``session/set_config_option``); older agents expose the unstable
+    ``session/set_model`` path. A rejected selection raises here and aborts
+    the invocation before the prompt, instead of silently running the
+    default model.
+    """
+    for option in getattr(session, "config_options", None) or []:
+        if option.category == "model" and getattr(option, "type", None) == "select":
+            await conn.set_config_option(config_id=option.id, session_id=session.session_id, value=model)
+            return
+    if getattr(session, "models", None) is not None:
+        await conn.set_session_model(model_id=model, session_id=session.session_id)
+        return
+    logger.warning(
+        "ACP agent '%s' advertised no model selector; the configured model '%s' was not applied",
+        agent,
+        model,
+    )
+
+
 def _format_invocation_error(agent: str, cmd: str, exc: Exception) -> str:
     """Return a user-facing ACP invocation error with actionable remediation."""
     if isinstance(exc, TimeoutError):
@@ -330,10 +355,9 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
                 client_capabilities=ClientCapabilities(),
                 client_info=Implementation(name="deerflow", title="DeerFlow", version="0.1.0"),
             )
-            session_kwargs: dict[str, Any] = {"cwd": physical_cwd, "mcp_servers": mcp_servers}
+            session = await conn.new_session(cwd=physical_cwd, mcp_servers=mcp_servers)
             if agent_config.model:
-                session_kwargs["model"] = agent_config.model
-            session = await conn.new_session(**session_kwargs)
+                await _select_acp_agent_model(conn, session, agent, agent_config.model)
             await conn.prompt(
                 session_id=session.session_id,
                 prompt=[text_block(prompt)],

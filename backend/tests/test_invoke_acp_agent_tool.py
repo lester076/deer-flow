@@ -7,7 +7,9 @@ import os
 import sys
 import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -393,7 +395,6 @@ async def test_invoke_acp_agent_uses_fixed_acp_workspace(monkeypatch, tmp_path):
                 "env": [],
             }
         ],
-        "model": "gpt-5-codex",
     }
     assert captured["prompt"] == {
         "session_id": "session-1",
@@ -1593,3 +1594,163 @@ async def test_invoke_acp_agent_spawns_an_absolute_path_for_a_relative_path_entr
     assert Path(captured["cmd"]) == shim
     assert Path(captured["cwd"]) != shim.parent
     assert result == "(no response)"
+
+
+AGENT_SCRIPT = r"""import asyncio
+import sys
+from pathlib import Path
+
+import acp
+from acp.schema import InitializeResponse, NewSessionResponse, PromptResponse
+
+model_api = sys.argv[4] if len(sys.argv) > 4 else ""
+
+
+class _TestAgent:
+    _model = "default"
+
+    def on_connect(self, conn):
+        self._conn = conn
+
+    async def _enter_phase(self, phase):
+        Path(sys.argv[3]).write_text(phase, encoding="utf-8")
+        if phase == "prompt":
+            await self._conn.session_update(
+                session_id="test-session", update=acp.update_agent_thought_text(phase)
+            )
+        if phase == sys.argv[1]:
+            await asyncio.Event().wait()
+        delay = float(sys.argv[2])
+        if delay:
+            await asyncio.sleep(delay)
+
+    async def initialize(self, protocol_version, client_capabilities=None, client_info=None, **kwargs):
+        await self._enter_phase("initialize")
+        return InitializeResponse(protocol_version=protocol_version)
+
+    async def new_session(self, cwd, additional_directories=None, mcp_servers=None, **kwargs):
+        await self._enter_phase("new_session")
+        if model_api == "config":
+            return NewSessionResponse(
+                session_id="test-session",
+                config_options=[
+                    {
+                        "id": "llm-model",
+                        "name": "Model",
+                        "category": "model",
+                        "type": "select",
+                        "currentValue": self._model,
+                        "options": [{"value": value, "name": value} for value in ("default", "chosen")],
+                    }
+                ],
+            )
+        if model_api == "legacy":
+            return NewSessionResponse(
+                session_id="test-session",
+                models={
+                    "currentModelId": self._model,
+                    "availableModels": [{"modelId": value, "name": value} for value in ("default", "chosen")],
+                },
+            )
+        return NewSessionResponse(session_id="test-session")
+
+    async def set_config_option(self, config_id, session_id, value, **kwargs):
+        assert model_api == "config" and config_id == "llm-model"
+        await self._select_model(value)
+        return {"configOptions": []}
+
+    async def set_session_model(self, model_id, session_id, **kwargs):
+        assert model_api == "legacy"
+        await self._select_model(model_id)
+        return {}
+
+    async def _select_model(self, model):
+        await self._enter_phase("select_model")
+        if model not in ("default", "chosen"):
+            raise ValueError("Unknown model")
+        self._model = model
+
+    async def prompt(self, session_id, prompt, **kwargs):
+        await self._enter_phase("prompt")
+        if model_api:
+            await self._conn.session_update(session_id=session_id, update=acp.update_agent_message_text(self._model))
+        return PromptResponse(stop_reason="end_turn")
+
+
+asyncio.run(acp.run_agent(_TestAgent(), use_unstable_protocol=model_api == "legacy"))
+"""
+
+
+def _run(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+@pytest.mark.parametrize("model_api", ["config", "legacy"])
+def test_invoke_acp_agent_selects_the_configured_model(tmp_path, model_api):
+    """The configured model must reach the session, not the agent default (#8599).
+
+    The pinned SDK routes unknown new_session kwargs into _meta, so the old
+    `model` kwarg never changed the session configuration.
+    """
+    agent = tmp_path / "agent.py"
+    agent.write_text(AGENT_SCRIPT, encoding="utf-8")
+    phase = tmp_path / "phase.txt"
+
+    from deerflow.config import paths as paths_module
+
+    async def go():
+        with (
+            TemporaryDirectory(prefix="deerflow-acp-model-") as home,
+            patch("deerflow.config.paths.get_paths", return_value=paths_module.Paths(base_dir=home)),
+            patch.object(ExtensionsConfig, "from_file", return_value=ExtensionsConfig(mcp_servers={}, skills={})),
+        ):
+            tool = build_invoke_acp_agent_tool(
+                {
+                    "test": ACPAgentConfig(
+                        command=sys.executable,
+                        args=[str(agent), "", "0", str(phase), model_api],
+                        description="Offline ACP fixture",
+                        model="chosen",
+                        timeout_seconds=30,
+                    )
+                }
+            )
+            return await tool.ainvoke({"agent": "test", "prompt": "report the selected model"})
+
+    assert _run(go()) == "chosen"
+
+
+def test_invoke_acp_agent_rejects_an_unknown_configured_model(tmp_path):
+    """A rejected selection must not silently run the default model (#8599)."""
+    agent = tmp_path / "agent.py"
+    agent.write_text(AGENT_SCRIPT, encoding="utf-8")
+    phase = tmp_path / "phase.txt"
+
+    from deerflow.config import paths as paths_module
+
+    async def go():
+        with (
+            TemporaryDirectory(prefix="deerflow-acp-model-") as home,
+            patch("deerflow.config.paths.get_paths", return_value=paths_module.Paths(base_dir=home)),
+            patch.object(ExtensionsConfig, "from_file", return_value=ExtensionsConfig(mcp_servers={}, skills={})),
+        ):
+            tool = build_invoke_acp_agent_tool(
+                {
+                    "test": ACPAgentConfig(
+                        command=sys.executable,
+                        args=[str(agent), "", "0", str(phase), "config"],
+                        description="Offline ACP fixture",
+                        model="unknown",
+                        timeout_seconds=30,
+                    )
+                }
+            )
+            return await tool.ainvoke({"agent": "test", "prompt": "report the selected model"})
+
+    result = _run(go())
+    assert result.startswith("Error invoking ACP agent")
+    assert "chosen" not in result
