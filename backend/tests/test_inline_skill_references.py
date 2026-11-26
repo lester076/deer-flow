@@ -86,10 +86,16 @@ def test_inline_batch_activates_once_with_owner_scoped_secrets_and_usage(catalog
     assert [entry["name"] for entry in usages] == names
     assert journal.record_skill_usage.call_count == count
     assert context[_SLASH_SKILL_ACTIVATION_RUN_KEY]
-    # The tool loop's next call sees the answered slash message in state.
+    # The tool loop's next call replays the same reminder from the run record:
+    # the skill stays visible for the whole turn, but the disk read, audit,
+    # and usage record stay once-per-activation (#8611).
     follow_up = original.override(messages=[*original.messages, response])
     invoke(follow_up)
-    assert seen[1].messages == follow_up.messages
+    assert len(seen[1].messages) == len(follow_up.messages) + 1
+    reminder_again = seen[1].messages[0]
+    assert isinstance(reminder_again, HumanMessage)
+    assert reminder_again.additional_kwargs["hide_from_ui"] is True
+    assert "Do &lt;safe&gt; work." in reminder_again.content
     assert journal.record_skill_usage.call_count == count
     assert context[ACTIVE_SECRETS_CONTEXT_KEY] == {f"KEY_{i}": f"value-{i}" for i in range(count)}
 

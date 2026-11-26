@@ -449,18 +449,6 @@ Follow this skill before choosing a general workflow. Load supporting resources 
             return recorded.activation
         return None
 
-    @staticmethod
-    def _target_answered(messages: list, target_index: int) -> bool:
-        """Whether a model response to the target already reached graph state.
-
-        Tells the tool loop's follow-up calls apart from a retry of the activation
-        call. LLMErrorHandlingMiddleware sits outside this middleware and retries a
-        failed or empty call by running this wrap again on the same request, so the
-        retry sees no AI message after the target; a follow-up call sees the
-        response the activation call produced.
-        """
-        return any(isinstance(message, AIMessage) for message in messages[target_index + 1 :])
-
     def _find_activation_target(self, messages: list, *, run_context: dict | None = None, activation_decisions: ActivationDecisions | None = None) -> tuple[int, HumanMessage, _ActivationResolution, str] | None:
         if not messages:
             return None
@@ -478,17 +466,15 @@ Follow this skill before choosing a general workflow. Load supporting resources 
         # The message scan above cannot catch it because the reminder lives only in
         # a per-call request override, never in state — the run context is the
         # durable signal (see _recorded_activation / _SLASH_SKILL_ACTIVATION_RUN_KEY).
-        # Once the activation call has been answered, skipping here avoids the
-        # redundant skill disk read, reminder re-injection, and duplicate "activate"
-        # audit. Before that, this call is a retry of the activation call and must
-        # carry the same reminder, replayed from the record rather than re-read so
-        # it matches what was audited. run_key is computed once here and threaded
-        # through to the write site in _prepare_model_request.
+        # Both a retry of the activation call and the tool loop's follow-up calls
+        # replay the recorded reminder; the once-per-activation side effects (skill
+        # disk read, "activate" audit, usage record) stay single. The docs promise
+        # the skill applies for the whole turn, and the follow-up calls do the real
+        # work (#8611). run_key is computed once here and threaded through to the
+        # write site in _prepare_model_request.
         run_key = self._activation_run_key(target)
         recorded = self._recorded_activation(run_context, run_key)
         if recorded is not None:
-            if self._target_answered(messages, target_index):
-                return None
             return target_index, target, _ActivationResolution(activation=recorded, replayed=True), run_key
 
         content = get_original_user_content_text(target.content, target.additional_kwargs)
